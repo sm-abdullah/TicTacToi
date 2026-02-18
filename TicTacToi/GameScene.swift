@@ -6,12 +6,24 @@
 //
 
 import SpriteKit
+import UIKit
 
 final class GameScene: SKScene {
 
     private enum Player: String {
         case x = "X"
         case o = "O"
+    }
+    
+    private enum GameMode {
+        case friend
+        case computer
+    }
+    
+    private enum Difficulty: String {
+        case easy = "Easy"
+        case medium = "Medium"
+        case hard = "Hard"
     }
 
     private struct Move {
@@ -26,27 +38,58 @@ final class GameScene: SKScene {
     private var currentPlayer: Player = .x
     private var gameEnded = false
     private var messageLabel: SKLabelNode?
+    private var modeLabel: SKLabelNode?
     private var scoreLabel: SKLabelNode?
     private var resetScoreButton: SKNode?
+    private var modeButton: SKNode?
+    private var soundButton: SKNode?
+    private var soundIconLabel: SKLabelNode?
     private var winLineNode: SKShapeNode?
+    private var selectionOverlay: SKNode?
     private var boardFrame: CGRect = .zero
     private var xWins = 0
     private var oWins = 0
     private let xWinsKey = "score_x_wins"
     private let oWinsKey = "score_o_wins"
+    private let soundEnabledKey = "sound_enabled"
     private let gameStrokeColor = SKColor(red: 0.16, green: 0.21, blue: 0.38, alpha: 1.0)
+    private let xMoveSound = SKAction.playSoundFileNamed("move_x.wav", waitForCompletion: false)
+    private let oMoveSound = SKAction.playSoundFileNamed("move_o.wav", waitForCompletion: false)
+    private let winSound = SKAction.playSoundFileNamed("win.wav", waitForCompletion: false)
+    private var soundEnabled = true
+    private var gameMode: GameMode = .friend
+    private var difficulty: Difficulty = .easy
+    private var humanPlayer: Player = .x
+    private var computerPlayer: Player = .o
+    private var isComputerThinking = false
+    private var isTurnTransitioning = false
+    private var isSelectingMode = true
+    private let aiQueue = DispatchQueue(label: "com.tictactoi.ai", qos: .userInitiated)
+    private var aiRequestID: UUID?
+    private let lightImpact = UIImpactFeedbackGenerator(style: .light)
+    private let mediumImpact = UIImpactFeedbackGenerator(style: .medium)
+    private let successFeedback = UINotificationFeedbackGenerator()
     var onSceneReady: (() -> Void)?
 
     override func didMove(to view: SKView) {
         removeAllChildren()
         backgroundColor = SKColor(red: 0.94, green: 0.96, blue: 1.0, alpha: 1.0)
         loadScores()
+        loadSoundPreference()
         setupBoard()
         setupMessageLabel()
+        setupModeLabel()
         setupScoreLabel()
         setupResetScoreButton()
+        setupModeButton()
+        setupSoundButton()
         updateTurnText()
+        updateModeText()
         updateScoreText()
+        presentModeSelection()
+        lightImpact.prepare()
+        mediumImpact.prepare()
+        successFeedback.prepare()
         DispatchQueue.main.async { [weak self] in
             self?.onSceneReady?()
         }
@@ -101,6 +144,16 @@ final class GameScene: SKScene {
         addChild(label)
         scoreLabel = label
     }
+    
+    private func setupModeLabel() {
+        let label = SKLabelNode(fontNamed: "AvenirNext-Medium")
+        label.fontSize = 18
+        label.fontColor = SKColor(red: 0.18, green: 0.22, blue: 0.38, alpha: 1.0)
+        label.position = CGPoint(x: size.width / 2, y: boardFrame.maxY + 24)
+        label.verticalAlignmentMode = .center
+        addChild(label)
+        modeLabel = label
+    }
 
     private func setupResetScoreButton() {
         let button = SKShapeNode(rectOf: CGSize(width: 180, height: 40), cornerRadius: 12)
@@ -122,6 +175,49 @@ final class GameScene: SKScene {
         addChild(button)
         resetScoreButton = button
     }
+    
+    private func setupModeButton() {
+        let button = SKShapeNode(rectOf: CGSize(width: 110, height: 36), cornerRadius: 10)
+        button.fillColor = SKColor(red: 0.18, green: 0.24, blue: 0.42, alpha: 1.0)
+        button.strokeColor = SKColor(red: 0.24, green: 0.31, blue: 0.52, alpha: 1.0)
+        button.lineWidth = 2
+        button.position = CGPoint(x: 72, y: size.height - 44)
+        button.name = "mode-button"
+        
+        let label = SKLabelNode(fontNamed: "AvenirNext-DemiBold")
+        label.text = "Mode"
+        label.fontSize = 17
+        label.fontColor = .white
+        label.verticalAlignmentMode = .center
+        label.horizontalAlignmentMode = .center
+        label.name = "mode-button"
+        button.addChild(label)
+        
+        addChild(button)
+        modeButton = button
+    }
+
+    private func setupSoundButton() {
+        let button = SKShapeNode(circleOfRadius: 20)
+        button.fillColor = SKColor(red: 0.18, green: 0.24, blue: 0.42, alpha: 1.0)
+        button.strokeColor = SKColor(red: 0.24, green: 0.31, blue: 0.52, alpha: 1.0)
+        button.lineWidth = 2
+        button.position = CGPoint(x: size.width - 44, y: size.height - 44)
+        button.name = "sound-button"
+
+        let label = SKLabelNode(fontNamed: "AvenirNext-DemiBold")
+        label.fontSize = 18
+        label.verticalAlignmentMode = .center
+        label.horizontalAlignmentMode = .center
+        label.fontColor = .white
+        label.name = "sound-button"
+        button.addChild(label)
+        soundIconLabel = label
+
+        addChild(button)
+        soundButton = button
+        updateSoundButtonUI()
+    }
 
     private func centerPoint(forRow row: Int, col: Int) -> CGPoint {
         let step = boardFrame.width / 3.0
@@ -139,15 +235,46 @@ final class GameScene: SKScene {
     }
 
     private func placeMove(row: Int, col: Int) {
-        guard board[row][col] == nil, !gameEnded else { return }
+        guard board[row][col] == nil, !gameEnded, !isTurnTransitioning else { return }
 
-        board[row][col] = currentPlayer
-        marks[row][col] = createAnimatedMark(for: currentPlayer, row: row, col: col)
-        moveHistory.append(Move(row: row, col: col, player: currentPlayer))
-
+        let playedPlayer = currentPlayer
+        board[row][col] = playedPlayer
+        marks[row][col] = createAnimatedMark(for: playedPlayer, row: row, col: col)
+        moveHistory.append(Move(row: row, col: col, player: playedPlayer))
+        playMoveFeedback(for: playedPlayer)
+        isTurnTransitioning = true
+        let animationDelay = markAnimationDuration(for: playedPlayer)
+        DispatchQueue.main.asyncAfter(deadline: .now() + animationDelay) { [weak self] in
+            self?.completeTurn(after: playedPlayer)
+        }
+    }
+    
+    private func markAnimationDuration(for player: Player) -> TimeInterval {
+        if player == .o {
+            return 0.34
+        }
+        // X draws two strokes with a small wait between them.
+        return 0.38
+    }
+    
+    private func scheduleComputerTurnIfNeeded(after delay: TimeInterval) {
+        guard gameMode == .computer, currentPlayer == computerPlayer, !gameEnded else { return }
+        let requestID = UUID()
+        aiRequestID = requestID
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            guard self.aiRequestID == requestID, !self.gameEnded, self.currentPlayer == self.computerPlayer else { return }
+            self.handleComputerTurnIfNeeded()
+        }
+    }
+    
+    private func completeTurn(after playedPlayer: Player) {
+        isComputerThinking = false
         if let result = winningResult() {
             gameEnded = true
+            aiRequestID = nil
             drawWinLine(for: result.line)
+            playWinFeedback()
             if result.player == .x {
                 xWins += 1
             } else {
@@ -156,16 +283,22 @@ final class GameScene: SKScene {
             saveScores()
             updateScoreText()
             messageLabel?.text = "\(result.player.rawValue) wins! Tap to restart"
+            isTurnTransitioning = false
             return
         }
-
+        
         if isDraw() {
+            aiRequestID = nil
             undoLastMoveAfterDraw()
+            isTurnTransitioning = false
+            scheduleComputerTurnIfNeeded(after: 0.0)
             return
         }
-
-        currentPlayer = currentPlayer == .x ? .o : .x
+        
+        currentPlayer = playedPlayer == .x ? .o : .x
         updateTurnText()
+        isTurnTransitioning = false
+        scheduleComputerTurnIfNeeded(after: 0.0)
     }
 
     private func winningResult() -> (player: Player, line: [(Int, Int)])? {
@@ -223,7 +356,23 @@ final class GameScene: SKScene {
     }
 
     private func updateTurnText() {
-        messageLabel?.text = "\(currentPlayer.rawValue) turn"
+        if gameMode == .computer {
+            if currentPlayer == humanPlayer {
+                messageLabel?.text = "Your turn (\(humanPlayer.rawValue))"
+            } else {
+                messageLabel?.text = "AI turn (\(computerPlayer.rawValue))"
+            }
+        } else {
+            messageLabel?.text = "\(currentPlayer.rawValue) turn"
+        }
+    }
+    
+    private func updateModeText() {
+        if gameMode == .friend {
+            modeLabel?.text = "Mode: Friend"
+        } else {
+            modeLabel?.text = "Mode: AI (\(difficulty.rawValue))"
+        }
     }
 
     private func updateScoreText() {
@@ -242,18 +391,48 @@ final class GameScene: SKScene {
         defaults.set(oWins, forKey: oWinsKey)
     }
 
+    private func loadSoundPreference() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: soundEnabledKey) == nil {
+            soundEnabled = true
+        } else {
+            soundEnabled = defaults.bool(forKey: soundEnabledKey)
+        }
+    }
+
+    private func saveSoundPreference() {
+        UserDefaults.standard.set(soundEnabled, forKey: soundEnabledKey)
+    }
+
+    private func toggleSound() {
+        soundEnabled.toggle()
+        saveSoundPreference()
+        updateSoundButtonUI()
+        lightImpact.impactOccurred()
+        lightImpact.prepare()
+    }
+
+    private func updateSoundButtonUI() {
+        soundIconLabel?.text = soundEnabled ? "🔊" : "🔇"
+    }
+
     private func resetScores() {
         xWins = 0
         oWins = 0
         saveScores()
         updateScoreText()
+        mediumImpact.impactOccurred()
+        mediumImpact.prepare()
     }
 
     private func resetGame() {
         board = Array(repeating: Array(repeating: Player?.none, count: 3), count: 3)
         moveHistory.removeAll()
-        currentPlayer = .x
+        assignRandomSymbolsForRound()
         gameEnded = false
+        isComputerThinking = false
+        isTurnTransitioning = false
+        aiRequestID = nil
         winLineNode?.removeFromParent()
         winLineNode = nil
         for row in 0..<3 {
@@ -263,6 +442,129 @@ final class GameScene: SKScene {
             }
         }
         updateTurnText()
+        handleComputerTurnIfNeeded()
+    }
+    
+    private func assignRandomSymbolsForRound() {
+        if gameMode == .computer {
+            humanPlayer = Bool.random() ? .x : .o
+            computerPlayer = humanPlayer == .x ? .o : .x
+            currentPlayer = .x
+            if modeLabel != nil {
+                modeLabel?.text = "Mode: AI (\(difficulty.rawValue)) • You: \(humanPlayer.rawValue)"
+            }
+        } else {
+            // Friend mode still randomizes which symbol starts each round.
+            humanPlayer = .x
+            computerPlayer = .o
+            currentPlayer = Bool.random() ? .x : .o
+            if modeLabel != nil {
+                modeLabel?.text = "Mode: Friend • Start: \(currentPlayer.rawValue)"
+            }
+        }
+    }
+    
+    private func presentModeSelection() {
+        selectionOverlay?.removeFromParent()
+        isSelectingMode = true
+        isComputerThinking = false
+        isTurnTransitioning = false
+        aiRequestID = nil
+        setHUDHidden(true)
+        
+        let overlay = SKNode()
+        overlay.zPosition = 200
+        
+        let bg = SKShapeNode(rectOf: CGSize(width: size.width, height: size.height))
+        bg.fillColor = SKColor(white: 0, alpha: 0.72)
+        bg.strokeColor = .clear
+        bg.position = CGPoint(x: size.width / 2, y: size.height / 2)
+        bg.name = "mode-overlay"
+        overlay.addChild(bg)
+        
+        let card = SKShapeNode(rectOf: CGSize(width: min(size.width * 0.82, 420), height: 340), cornerRadius: 18)
+        card.fillColor = SKColor(red: 0.96, green: 0.97, blue: 1.0, alpha: 1.0)
+        card.strokeColor = SKColor(red: 0.82, green: 0.86, blue: 0.95, alpha: 1.0)
+        card.lineWidth = 2
+        card.position = CGPoint(x: size.width / 2, y: size.height / 2)
+        overlay.addChild(card)
+        
+        let title = SKLabelNode(fontNamed: "AvenirNext-Heavy")
+        title.text = "Choose Playing Mode"
+        title.fontSize = 26
+        title.fontColor = gameStrokeColor
+        title.position = CGPoint(x: size.width / 2, y: size.height / 2 + 130)
+        overlay.addChild(title)
+        
+        overlay.addChild(makeSelectionButton(title: "Play with Friend", name: "mode-friend", at: CGPoint(x: size.width / 2, y: size.height / 2 + 56)))
+        overlay.addChild(makeSelectionButton(title: "Easy", name: "mode-cpu-easy", at: CGPoint(x: size.width / 2, y: size.height / 2 + 6)))
+        overlay.addChild(makeSelectionButton(title: "Medium", name: "mode-cpu-medium", at: CGPoint(x: size.width / 2, y: size.height / 2 - 44)))
+        overlay.addChild(makeSelectionButton(title: "Hard", name: "mode-cpu-hard", at: CGPoint(x: size.width / 2, y: size.height / 2 - 94)))
+        
+        let note = SKLabelNode(fontNamed: "AvenirNext-Medium")
+        note.text = "Hard uses best-play AI"
+        note.fontSize = 15
+        note.fontColor = SKColor(red: 0.29, green: 0.35, blue: 0.53, alpha: 1.0)
+        note.position = CGPoint(x: size.width / 2, y: size.height / 2 - 138)
+        overlay.addChild(note)
+        
+        addChild(overlay)
+        selectionOverlay = overlay
+    }
+    
+    private func makeSelectionButton(title: String, name: String, at point: CGPoint) -> SKNode {
+        let button = SKShapeNode(rectOf: CGSize(width: min(size.width * 0.68, 320), height: 38), cornerRadius: 11)
+        button.fillColor = SKColor(red: 0.2, green: 0.27, blue: 0.47, alpha: 1.0)
+        button.strokeColor = SKColor(red: 0.26, green: 0.34, blue: 0.56, alpha: 1.0)
+        button.lineWidth = 2
+        button.position = point
+        button.name = name
+        
+        let label = SKLabelNode(fontNamed: "AvenirNext-DemiBold")
+        label.text = title
+        label.fontSize = 18
+        label.fontColor = .white
+        label.verticalAlignmentMode = .center
+        label.horizontalAlignmentMode = .center
+        label.name = name
+        button.addChild(label)
+        return button
+    }
+    
+    private func selectMode(from nodeName: String) {
+        switch nodeName {
+        case "mode-friend":
+            gameMode = .friend
+            difficulty = .easy
+        case "mode-cpu-easy":
+            gameMode = .computer
+            difficulty = .easy
+        case "mode-cpu-medium":
+            gameMode = .computer
+            difficulty = .medium
+        case "mode-cpu-hard":
+            gameMode = .computer
+            difficulty = .hard
+        default:
+            return
+        }
+        
+        selectionOverlay?.removeFromParent()
+        selectionOverlay = nil
+        isSelectingMode = false
+        setHUDHidden(false)
+        updateModeText()
+        resetGame()
+    }
+    
+    private func setHUDHidden(_ hidden: Bool) {
+        let alpha: CGFloat = hidden ? 0.0 : 1.0
+        messageLabel?.alpha = alpha
+        modeLabel?.alpha = alpha
+        scoreLabel?.alpha = alpha
+        resetScoreButton?.alpha = alpha
+        modeButton?.alpha = alpha
+        soundButton?.alpha = alpha
     }
 
     private func drawWinLine(for line: [(Int, Int)]) {
@@ -383,16 +685,205 @@ final class GameScene: SKScene {
         })
     }
 
+    private func playMoveFeedback(for player: Player) {
+        if soundEnabled {
+            run(player == .x ? xMoveSound : oMoveSound)
+        }
+        lightImpact.impactOccurred()
+        lightImpact.prepare()
+    }
+
+    private func playWinFeedback() {
+        if soundEnabled {
+            run(winSound)
+        }
+        successFeedback.notificationOccurred(.success)
+        successFeedback.prepare()
+    }
+    
+    private func handleComputerTurnIfNeeded() {
+        guard gameMode == .computer, currentPlayer == computerPlayer, !gameEnded, !isTurnTransitioning else { return }
+        isComputerThinking = true
+        let requestID = UUID()
+        aiRequestID = requestID
+        let stateSnapshot = board
+        let difficultySnapshot = difficulty
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self = self else { return }
+            guard self.aiRequestID == requestID, !self.gameEnded, self.currentPlayer == self.computerPlayer else {
+                self.isComputerThinking = false
+                return
+            }
+
+            self.aiQueue.async { [weak self] in
+                guard let self = self else { return }
+                let move = self.computerMove(on: stateSnapshot, difficulty: difficultySnapshot)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    guard self.aiRequestID == requestID, !self.gameEnded, self.currentPlayer == self.computerPlayer else {
+                        self.isComputerThinking = false
+                        return
+                    }
+                    if let move = move {
+                        self.placeMove(row: move.0, col: move.1)
+                    }
+                    self.isComputerThinking = false
+                }
+            }
+        }
+    }
+    
+    private func computerMove(on state: [[Player?]], difficulty: Difficulty) -> (Int, Int)? {
+        switch difficulty {
+        case .easy:
+            return randomAvailableMove(on: state)
+        case .medium:
+            if let move = immediateWinningMove(for: computerPlayer, on: state) { return move }
+            if let move = immediateWinningMove(for: humanPlayer, on: state) { return move }
+            return randomAvailableMove(on: state)
+        case .hard:
+            if let move = bestMoveMinimax(for: computerPlayer, on: state) { return move }
+            return randomAvailableMove(on: state)
+        }
+    }
+    
+    private func randomAvailableMove(on state: [[Player?]]) -> (Int, Int)? {
+        return availableMoves(on: state).randomElement()
+    }
+    
+    private func availableMoves(on state: [[Player?]]) -> [(Int, Int)] {
+        var moves: [(Int, Int)] = []
+        for row in 0..<3 {
+            for col in 0..<3 where state[row][col] == nil {
+                moves.append((row, col))
+            }
+        }
+        return moves
+    }
+    
+    private func immediateWinningMove(for player: Player, on state: [[Player?]]) -> (Int, Int)? {
+        for move in availableMoves(on: state) {
+            var test = state
+            test[move.0][move.1] = player
+            if winner(on: test) == player {
+                return move
+            }
+        }
+        return nil
+    }
+    
+    private func winner(on state: [[Player?]]) -> Player? {
+        let lines: [[(Int, Int)]] = [
+            [(0, 0), (0, 1), (0, 2)],
+            [(1, 0), (1, 1), (1, 2)],
+            [(2, 0), (2, 1), (2, 2)],
+            [(0, 0), (1, 0), (2, 0)],
+            [(0, 1), (1, 1), (2, 1)],
+            [(0, 2), (1, 2), (2, 2)],
+            [(0, 0), (1, 1), (2, 2)],
+            [(0, 2), (1, 1), (2, 0)]
+        ]
+        for line in lines {
+            guard let first = state[line[0].0][line[0].1] else { continue }
+            if state[line[1].0][line[1].1] == first && state[line[2].0][line[2].1] == first {
+                return first
+            }
+        }
+        return nil
+    }
+    
+    private func bestMoveMinimax(for aiPlayer: Player, on state: [[Player?]]) -> (Int, Int)? {
+        let candidateMoves = availableMoves(on: state)
+        guard !candidateMoves.isEmpty else { return nil }
+        
+        var bestScore = Int.min
+        var bestMove: (Int, Int)?
+        for move in candidateMoves {
+            var next = state
+            next[move.0][move.1] = aiPlayer
+            let score = minimax(on: next, current: .x, ai: aiPlayer, depth: 0)
+            if score > bestScore {
+                bestScore = score
+                bestMove = move
+            }
+        }
+        return bestMove
+    }
+    
+    private func minimax(on state: [[Player?]], current: Player, ai: Player, depth: Int) -> Int {
+        if let w = winner(on: state) {
+            if w == ai {
+                return 10 - depth
+            }
+            return depth - 10
+        }
+        if availableMoves(on: state).isEmpty {
+            return 0
+        }
+        
+        let nextPlayer: Player = current == .x ? .o : .x
+        if current == ai {
+            var best = Int.min
+            for move in availableMoves(on: state) {
+                var next = state
+                next[move.0][move.1] = current
+                best = max(best, minimax(on: next, current: nextPlayer, ai: ai, depth: depth + 1))
+            }
+            return best
+        }
+        
+        var best = Int.max
+        for move in availableMoves(on: state) {
+            var next = state
+            next[move.0][move.1] = current
+            best = min(best, minimax(on: next, current: nextPlayer, ai: ai, depth: depth + 1))
+        }
+        return best
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let point = touches.first?.location(in: self) else { return }
+        
+        if isSelectingMode {
+            let touchedNode = atPoint(point)
+            if let name = touchedNode.name {
+                selectMode(from: name)
+            } else if let parentName = touchedNode.parent?.name {
+                selectMode(from: parentName)
+            }
+            return
+        }
+        
+        if gameEnded {
+            resetGame()
+            return
+        }
+
+        if isSoundButtonTap(at: point) {
+            toggleSound()
+            return
+        }
+        
+        if isModeButtonTap(at: point) {
+            presentModeSelection()
+            return
+        }
 
         if isResetScoreTap(at: point) {
             resetScores()
             return
         }
-
-        if gameEnded {
-            resetGame()
+        
+        if isComputerThinking {
+            return
+        }
+        
+        if isTurnTransitioning {
+            return
+        }
+        
+        if gameMode == .computer && currentPlayer != humanPlayer {
             return
         }
 
@@ -404,6 +895,30 @@ final class GameScene: SKScene {
         guard let button = resetScoreButton else { return false }
         let touchedNode = atPoint(point)
         if touchedNode.name == "reset-score-button" || touchedNode.parent?.name == "reset-score-button" {
+            return true
+        }
+        if let shape = button as? SKShapeNode {
+            return shape.contains(point)
+        }
+        return false
+    }
+
+    private func isSoundButtonTap(at point: CGPoint) -> Bool {
+        guard let button = soundButton else { return false }
+        let touchedNode = atPoint(point)
+        if touchedNode.name == "sound-button" || touchedNode.parent?.name == "sound-button" {
+            return true
+        }
+        if let shape = button as? SKShapeNode {
+            return shape.contains(point)
+        }
+        return false
+    }
+    
+    private func isModeButtonTap(at point: CGPoint) -> Bool {
+        guard let button = modeButton else { return false }
+        let touchedNode = atPoint(point)
+        if touchedNode.name == "mode-button" || touchedNode.parent?.name == "mode-button" {
             return true
         }
         if let shape = button as? SKShapeNode {
